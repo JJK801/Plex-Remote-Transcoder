@@ -19,6 +19,7 @@ import time
 import urllib
 import urllib2
 import uuid
+import Queue
 
 from distutils.spawn import find_executable
 
@@ -89,6 +90,8 @@ DEFAULT_CONFIG = {
 # This is the name we give to the original transcoder, which must be renamed
 NEW_TRANSCODER_NAME      = "plex_transcoder"
 ORIGINAL_TRANSCODER_NAME = "Plex Transcoder"
+
+SEGMENTS_PER_NODE = 5
 
 REMOTE_ARGS = ("%(env)s;"
                "cd %(working_dir)s;"
@@ -303,6 +306,25 @@ def transcode_local():
         if output and is_debug:
             log.debug(output.strip('\n'))
 
+def get_available_remote_servers():
+    config = get_config()
+    servers = config["servers"]
+
+    for hostname, host in servers.items():
+        log.debug("Getting load for host '%s'" % hostname)
+        host["load"] = get_system_load_remote(hostname, host["port"], host["user"])
+
+        if not host["load"]:
+            # If no load is returned, then it is likely that the host
+            # is offline or unreachable
+            log.debug("Couldn't get load for host '%s'" % hostname)
+            del servers[hostname]
+            continue
+
+    log.debug("Available servers : %s\n" % servers)
+
+    return servers
+
 def transcode_remote():
     setup_logging()
 
@@ -356,54 +378,73 @@ def transcode_remote():
         except Exception, e:
             log.error("Error retreiving host list via '%s': %s" % (config["servers_script"], str(e)))
 
-    hostname, host = None, None
+    command = command.replace("127.0.0.1", config["ipaddress"]).split(' ')
+    segment_time = int(command[command.index("-segment_time") + 1])
+    ss = int(command[command.index("-ss") + 1])
+    start_segment = int(command[command.index("-segment_start_number") + 1])
+    q = Queue.Queue()
+    init = True
+    just_finished = False
+    transcoding_servers = []
+    consecutive_errors = 0
+    log.info("Initializing distributed trancode %s" % command)
+    log.info("Segment time: %s" % segment_time)
 
-    # Let's try to load-balance
-    min_load = None
-    for hostname, host in servers.items():
+    while (consecutive_errors < 5) and (q.empty() is False or init is True or just_finished is True):
+        log.info("Fetching available servers")
+        available_servers = get_available_remote_servers()
+        just_finished = False
 
-        log.debug("Getting load for host '%s'" % hostname)
-        load = get_system_load_remote(hostname, host["port"], host["user"])
+        for hostname, host in available_servers.items():
+            log.info("Checking server %s" % hostname)
+            if hostname in transcoding_servers:
+                log.info("Server already transcoding a segment")
+                continue
 
-        if not load:
-            # If no load is returned, then it is likely that the host
-            # is offline or unreachable
-            log.debug("Couldn't get load for host '%s'" % hostname)
+            log.info("Starting trancoder with segment %s" % str(start_segment))
+            proc = process_segment(host, hostname, start_segment, segment_time, ss, command)
+            transcoding_servers.append(hostname)
+            start_segment+=SEGMENTS_PER_NODE
+            ss+=segment_time*SEGMENTS_PER_NODE
+            q.put((proc, hostname))
+
+        if init is True:
+            log.info("Distributed transcode initialized")
+            init = False
             continue
 
-        log.debug("Log for '%s': %s" % (hostname, str(load)))
+        proc, hostname = q.get()
+        log.info("Checking if %s finished transcode" % hostname)
+        code = proc.poll()
 
-        # XXX: Use more that just 1-minute load?
-        if min_load is None or min_load[1] > load[0]:
-            min_load = (hostname, load[0],)
+        if code is None:
+            q.put((proc, hostname))
+        else:
+            log.info("%s finished transcode" % hostname)
+            just_finished = True
+            if code == 1:
+                consecutive_errors += 1
+                log.info("Transcode returned an error (%s)" % str(consecutive_errors))
+            else:
+                consecutive_errors = 0
 
-    if min_load is None:
-        log.info("No hosts found...using local")
-        return transcode_local()
+            transcoding_servers.remove(hostname)
 
-    # Select lowest-load host
-    log.info("Host with minimum load is '%s'" % min_load[0])
-    hostname, host = min_load[0], servers[min_load[0]]
+        time.sleep(.300)
 
-    log.info("Using transcode host '%s'" % hostname)
+    log.info("Transcode finished")
 
-    # Remap the 127.0.0.1 reference to the proper address
-    command = command.replace("127.0.0.1", config["ipaddress"])
+def process_segment (host, hostname, segment, time, ss, command):
+    command = ["ssh", "%s@%s" % (host["user"], hostname), "-p", host["port"]] + command
+    cmd = []
 
-    #
-    # TODO: Remap file-path to PMS URLs
-    #
-
-    args = ["ssh", "%s@%s" % (host["user"], hostname), "-p", host["port"]] + [command]
-
-    log.info("Launching transcode_remote with args %s\n" % args)
+    command[command.index("-segment_start_number") + 1] = str(segment)
+    command[command.index("-ss") + 1] = str(ss)
+    command.insert(command.index("-i"), "-t")
+    command.insert(command.index("-i"), str(int(command[command.index("-segment_time") + 1]) * SEGMENTS_PER_NODE))
 
     # Spawn the process
-    proc = subprocess.Popen(args)
-    proc.wait()
-
-    log.info("Transcode stopped on host '%s'" % hostname)
-
+    return subprocess.Popen(command)
 
 def re_get(regex, string, group=0, default=None):
     match = regex.search(string)
@@ -597,13 +638,13 @@ def usage():
     print "Usage:\n"
     print "  %s [options]\n" % os.path.basename(sys.argv[0])
     print (
-        "Options:\n\n" 
-        "  usage, help, -h, ?    Show usage page\n" 
-        "  get_load              Show the load of the system\n" 
-        "  get_cluster_load      Show the load of all systems in the cluster\n" 
-        "  install               Install PRT for the first time and then sets up configuration\n" 
-        "  overwrite             Fix PRT after PMS has had a version update breaking PRT\n" 
-        "  add_host              Add an extra host to the list of slaves PRT is to use\n" 
+        "Options:\n\n"
+        "  usage, help, -h, ?    Show usage page\n"
+        "  get_load              Show the load of the system\n"
+        "  get_cluster_load      Show the load of all systems in the cluster\n"
+        "  install               Install PRT for the first time and then sets up configuration\n"
+        "  overwrite             Fix PRT after PMS has had a version update breaking PRT\n"
+        "  add_host              Add an extra host to the list of slaves PRT is to use\n"
         "  remove_host           Removes a host from the list of slaves PRT is to use\n"
         "  sessions              Display current sessions\n"
         "  check_config          Checks the current configuration for errors\n")
@@ -707,4 +748,3 @@ def main():
     else:
         usage()
         sys.exit(-1)
-
