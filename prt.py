@@ -131,6 +131,7 @@ def printf(message, *args, **kwargs):
     sys.stdout.write(colored(message % args, color, attrs=attrs))
     sys.stdout.flush()
 
+
 def get_auth_token():
     url = "https://plex.tv/users/sign_in.json"
     payload = urllib.urlencode({
@@ -251,6 +252,7 @@ def overwrite_transcoder_after_upgrade():
          print "Transcoder hasn't been previously installed, please use install option"
          sys.exit(1)
 
+
 def build_env(host=None):
     # TODO: This really should be done in a way that is specific to the target
     #       in the case that the target is a different architecture than the host
@@ -306,9 +308,11 @@ def transcode_local():
         if output and is_debug:
             log.debug(output.strip('\n'))
 
+
 def get_available_remote_servers():
     config = get_config()
     servers = config["servers"]
+    available_servers = {}
 
     for hostname, host in servers.items():
         log.debug("Getting load for host '%s'" % hostname)
@@ -318,12 +322,14 @@ def get_available_remote_servers():
             # If no load is returned, then it is likely that the host
             # is offline or unreachable
             log.debug("Couldn't get load for host '%s'" % hostname)
-            del servers[hostname]
             continue
 
-    log.debug("Available servers : %s\n" % servers)
+        available_servers[hostname] = host
 
-    return servers
+    log.debug("Available servers : %s\n" % available_servers)
+
+    return available_servers
+
 
 def transcode_remote():
     setup_logging()
@@ -408,7 +414,7 @@ def transcode_remote():
             ss+=segment_time*SEGMENTS_PER_NODE
             q.put((proc, hostname))
 
-        if init is True:
+        if init:
             log.info("Distributed transcode initialized")
             init = False
             continue
@@ -434,6 +440,7 @@ def transcode_remote():
 
     log.info("Transcode finished")
 
+
 def process_segment (host, hostname, segment, time, ss, command):
     command = ["ssh", "%s@%s" % (host["user"], hostname), "-p", host["port"]] + command
     cmd = []
@@ -446,6 +453,7 @@ def process_segment (host, hostname, segment, time, ss, command):
     # Spawn the process
     return subprocess.Popen(command)
 
+
 def re_get(regex, string, group=0, default=None):
     match = regex.search(string)
     if match:
@@ -455,6 +463,7 @@ def re_get(regex, string, group=0, default=None):
             if group == "all":
                 return match.groups()
     return default
+
 
 def et_get(node, attrib, default=None):
     if node is not None:
@@ -477,6 +486,7 @@ def get_plex_sessions(auth_token=None):
                 'file': et_get(node.find('.//Media/Part'), 'file')
         }
     return sessions
+
 
 def get_sessions():
     sessions = {}
@@ -527,6 +537,7 @@ def get_sessions():
 
                 sessions[m.groups()[0]] = data
     return sessions
+
 
 def check_config():
     """
